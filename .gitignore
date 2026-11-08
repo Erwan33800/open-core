@@ -1,0 +1,4 @@
+build/
+build-tests/
+.DS_Store
+__pycache__/

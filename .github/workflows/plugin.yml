@@ -1,0 +1,214 @@
+# CI commune aux plugins Open (workflow réutilisable).
+#
+# Le plugin l'appelle depuis son .github/workflows/build.yml (voir README.md d'open-core). La version d'open-core
+# utilisée pour compiler est lue dans le fichier OPEN_CORE_VERSION à la racine du plugin (une seule source de vérité,
+# aussi lue par CMake et par build_ui.py).
+#
+# Jobs : tests du DSP (Linux), page d'interface à jour + test du pont (Linux), Windows (VST3 + Standalone + pluginval),
+# macOS (VST3 + AU), puis publication de la release « latest » sur la branche indiquée.
+name: Plugin
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "Nom de la cible CMake, ex. OpenFilter (cibles OpenFilter_VST3, OpenFilter_Standalone, OpenFilter_AU)"
+        required: true
+        type: string
+      product-name:
+        description: "Nom du produit, ex. Open Filter (nom du dossier .vst3)"
+        required: true
+        type: string
+      slug:
+        description: "Identifiant court, ex. openfilter (page ui/<slug>_ui.html)"
+        required: true
+        type: string
+      dsp-tests-args:
+        description: "Arguments CMake de la configuration « DSP seul », ex. -DOPENFILTER_PLUGIN=OFF"
+        required: true
+        type: string
+      tests-target:
+        description: "Cible des tests compilée aussi sur Windows, ex. OpenFilterTests (vide : aucune)"
+        required: false
+        type: string
+        default: ""
+      ui-test-command:
+        description: "Commande du test du pont interface / plugin, ex. python3 tests/ui/bridge_test.py (vide : aucun)"
+        required: false
+        type: string
+        default: ""
+      release-branch:
+        description: "Branche dont chaque push publie la release « latest »"
+        required: false
+        type: string
+        default: main
+      core-repo:
+        description: "Dépôt d'open-core"
+        required: false
+        type: string
+        default: Erwan33800/open-core
+
+jobs:
+  dsp-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version d'open-core
+        id: core
+        run: echo "ref=$(head -n1 OPEN_CORE_VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.core-repo }}
+          ref: ${{ steps.core.outputs.ref }}
+          path: .open-core
+      - name: Configuration
+        run: cmake -B build-tests ${{ inputs.dsp-tests-args }} -DCMAKE_BUILD_TYPE=Release
+        env:
+          OPEN_CORE_DIR: ${{ github.workspace }}/.open-core
+      - name: Compilation
+        run: cmake --build build-tests --parallel
+      - name: Tests
+        run: ctest --test-dir build-tests --output-on-failure
+
+  # Interface : la page générée est à jour, et le pont avec le plugin fonctionne (faux plugin dans Chrome).
+  ui-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version d'open-core
+        id: core
+        run: echo "ref=$(head -n1 OPEN_CORE_VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.core-repo }}
+          ref: ${{ steps.core.outputs.ref }}
+          path: .open-core
+      - name: La page générée est à jour
+        env:
+          OPEN_CORE_DIR: ${{ github.workspace }}/.open-core
+        run: |
+          python3 ui/build_ui.py
+          git diff --exit-code ui/${{ inputs.slug }}_ui.html || (echo "ui/${{ inputs.slug }}_ui.html n'est pas à jour : lance python ui/build_ui.py et commite le résultat" && exit 1)
+      - name: Test du pont interface / plugin
+        if: inputs.ui-test-command != ''
+        run: ${{ inputs.ui-test-command }}
+
+  windows:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version d'open-core
+        id: core
+        shell: pwsh
+        run: |
+          $ref = (Get-Content OPEN_CORE_VERSION -TotalCount 1).Trim()
+          "ref=$ref" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.core-repo }}
+          ref: ${{ steps.core.outputs.ref }}
+          path: .open-core
+
+      - name: SDK WebView2 (NuGet)
+        shell: pwsh
+        run: nuget install Microsoft.Web.WebView2 -Version 1.0.1901.177 -OutputDirectory "$env:RUNNER_TEMP/nuget"
+
+      - name: Configuration
+        shell: pwsh
+        env:
+          OPEN_CORE_DIR: ${{ github.workspace }}/.open-core
+        run: |
+          $loc = "$env:RUNNER_TEMP/nuget" -replace '\\','/'
+          cmake -B build -G "Visual Studio 17 2022" -A x64 "-DJUCE_WEBVIEW2_PACKAGE_LOCATION=$loc"
+
+      - name: Compilation
+        shell: pwsh
+        run: cmake --build build --config Release --target ${{ inputs.target }}_VST3 ${{ inputs.target }}_Standalone ${{ inputs.tests-target }} --parallel
+
+      - name: Tests
+        if: inputs.tests-target != ''
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: pluginval (niveau 10)
+        shell: pwsh
+        run: |
+          # GitHub renvoie parfois une erreur 5xx passagère : on réessaie le téléchargement.
+          Invoke-WebRequest "https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip" -OutFile "$env:RUNNER_TEMP/pluginval.zip" -MaximumRetryCount 5 -RetryIntervalSec 10
+          Expand-Archive "$env:RUNNER_TEMP/pluginval.zip" -DestinationPath "$env:RUNNER_TEMP/pluginval" -Force
+          # pluginval.exe est une application graphique : PowerShell ne l'attend pas avec « & »
+          # (le code de sortie resterait vide). Start-Process -Wait -PassThru attend et rend le vrai code.
+          $plugin = (Resolve-Path "build/${{ inputs.target }}_artefacts/Release/VST3/${{ inputs.product-name }}.vst3").Path
+          $p = Start-Process -FilePath "$env:RUNNER_TEMP/pluginval/pluginval.exe" -Wait -PassThru -NoNewWindow `
+                 -ArgumentList @("--strictness-level","10","--validate-in-process","--skip-gui-tests","--validate","`"$plugin`"")
+          if ($p.ExitCode -ne 0) { throw "pluginval a échoué (code $($p.ExitCode))" }
+
+      - name: Paquet
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item -Recurse "build/${{ inputs.target }}_artefacts/Release/VST3/${{ inputs.product-name }}.vst3" out/
+          Copy-Item "build/${{ inputs.target }}_artefacts/Release/Standalone/${{ inputs.product-name }}.exe" out/
+          Copy-Item README.md out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.target }}-Windows
+          path: out
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version d'open-core
+        id: core
+        run: echo "ref=$(head -n1 OPEN_CORE_VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.core-repo }}
+          ref: ${{ steps.core.outputs.ref }}
+          path: .open-core
+      - name: Configuration
+        env:
+          OPEN_CORE_DIR: ${{ github.workspace }}/.open-core
+        run: cmake -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+      - name: Compilation
+        run: cmake --build build --config Release --target ${{ inputs.target }}_VST3 ${{ inputs.target }}_AU -- -quiet
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.target }}-macOS
+          path: |
+            build/${{ inputs.target }}_artefacts/Release/VST3/${{ inputs.product-name }}.vst3
+            build/${{ inputs.target }}_artefacts/Release/AU/${{ inputs.product-name }}.component
+
+  release:
+    # Publie les fichiers prêts à installer sur la page « Releases » du dépôt (version « latest »)
+    if: github.ref == format('refs/heads/{0}', inputs.release-branch)
+    needs: [dsp-tests, ui-tests, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Archives
+        run: |
+          cd dl/${{ inputs.target }}-Windows && zip -qr ../../${{ inputs.target }}-Windows.zip . && cd ../..
+          cd dl/${{ inputs.target }}-macOS && zip -qr ../../${{ inputs.target }}-macOS.zip . && cd ../..
+          ls -la *.zip
+
+      - name: Release « latest »
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest ${{ inputs.target }}-Windows.zip ${{ inputs.target }}-macOS.zip \
+            --target "${{ github.sha }}" \
+            --title "${{ inputs.product-name }} (dernière version)" \
+            --notes "Compilé automatiquement depuis le commit ${{ github.sha }}. Télécharge **${{ inputs.target }}-Windows.zip** (ou **${{ inputs.target }}-macOS.zip**), puis suis la section Installer du README." \
+            --latest
