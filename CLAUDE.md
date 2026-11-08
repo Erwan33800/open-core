@@ -32,5 +32,5 @@ Tag `vX.Y.Z` sur ce dépôt. Les plugins l'épinglent dans `OPEN_CORE_VERSION` (
 
 ## État
 
-- v0.1.0 (en préparation, pas encore publiée sur GitHub) : extrait d'Open Filter.
+- v0.1.0 (publiée le 8 nov. 2026, dépôt https://github.com/Erwan33800/open-core) : extrait d'Open Filter. Le chemin « téléchargement à la version épinglée » de CMake est vérifié.
 - Utilisé par : Open Filter. Open Groove n'est pas migré (décision : il le sera plus tard ou jamais).
